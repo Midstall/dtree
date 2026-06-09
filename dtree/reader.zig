@@ -13,11 +13,9 @@ pub const Node = union(enum) {
         depth: usize,
         name: []const u8,
 
-        pub fn format(self: Begin, comptime _: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-            _ = options;
-
+        pub fn format(self: Begin, writer: *std.Io.Writer) std.Io.Writer.Error!void {
             try writer.writeAll(@typeName(Begin));
-            try writer.print("{{ .depth = {}, .name = \"{s}\" }}", .{
+            try writer.print("{{ .depth = {d}, .name = \"{s}\" }}", .{
                 self.depth,
                 self.name,
             });
@@ -33,11 +31,9 @@ pub const Node = union(enum) {
         name: []const u8,
         value: []const u8,
 
-        pub fn format(self: Prop, comptime _: []const u8, options: std.fmt.FormatOptions, writer: anytype) !void {
-            _ = options;
-
+        pub fn format(self: Prop, writer: *std.Io.Writer) std.Io.Writer.Error!void {
             try writer.writeAll(@typeName(Prop));
-            try writer.print("{{ .depth = {}, .name = \"{s}\", .value = {any} }}", .{
+            try writer.print("{{ .depth = {d}, .name = \"{s}\", .value = {any} }}", .{
                 self.depth,
                 self.name,
                 self.value,
@@ -98,7 +94,7 @@ pub const NodeIterator = struct {
     }
 
     pub fn readInt(self: *NodeIterator, comptime T: type) T {
-        const len = @divExact(@typeInfo(T).Int.bits, 8);
+        const len = @divExact(@typeInfo(T).int.bits, 8);
         const pos = self.offset();
         const value = self.reader.buff[pos..][0..len];
         self.pos += len;
@@ -114,8 +110,8 @@ pub const NodeIterator = struct {
         return res[0];
     }
 
-    pub fn token(self: *NodeIterator) std.meta.IntToEnumError!types.Token {
-        return std.meta.intToEnum(types.Token, self.readInt(u32));
+    pub fn token(self: *NodeIterator) error{InvalidToken}!types.Token {
+        return std.enums.fromInt(types.Token, self.readInt(u32)) orelse error.InvalidToken;
     }
 
     pub fn stringAt(self: *NodeIterator, off: usize) []const u8 {
@@ -170,21 +166,15 @@ allocator: ?Allocator,
 hdr: types.Header,
 buff: []const u8,
 
-fn init(
-    allocator: ?Allocator,
-    reader: anytype,
-    args: anytype,
-    errors: anytype,
-    initBufferFunc: fn (?Allocator, types.Header, @TypeOf(args)) (Allocator.Error || @TypeOf(reader).NoEofError || errors)![]const u8,
-) !Self {
-    const hdr = try reader.readStructBig(types.Header);
-    if (hdr.magic != types.magic) return error.InvalidMagic;
-
-    const buff = try initBufferFunc(allocator, hdr, args);
-    errdefer {
-        if (allocator) |alloc| alloc.free(buff);
+fn readHeader(bytes: *const [@sizeOf(types.Header)]u8) types.Header {
+    var hdr: types.Header = @bitCast(bytes.*);
+    if (builtin.cpu.arch.endian() != std.builtin.Endian.big) {
+        std.mem.byteSwapAllFields(types.Header, &hdr);
     }
+    return hdr;
+}
 
+fn finish(allocator: ?Allocator, hdr: types.Header, buff: []const u8) error{ Truncated, OverRead, InvalidToken }!Self {
     const buffSize = hdr.totalsize - @sizeOf(types.Header);
     if (buff.len < buffSize) return error.Truncated;
     if (buff.len > buffSize) return error.OverRead;
@@ -198,41 +188,26 @@ fn init(
 }
 
 pub fn initBuffer(buff: []const u8) !Self {
-    var stream = std.io.fixedBufferStream(buff);
-    return try init(null, stream.reader(), stream, error{}, (struct {
-        fn func(
-            _: ?Allocator,
-            hdr: types.Header,
-            argStream: std.io.FixedBufferStream([]const u8),
-        ) (Allocator.Error || std.io.FixedBufferStream([]const u8).Reader.NoEofError)![]const u8 {
-            return argStream.buffer[argStream.pos..hdr.totalsize];
-        }
-    }).func);
+    if (buff.len < @sizeOf(types.Header)) return error.Truncated;
+    const hdr = readHeader(buff[0..@sizeOf(types.Header)]);
+    if (hdr.magic != types.magic) return error.InvalidMagic;
+    if (buff.len < hdr.totalsize) return error.Truncated;
+    return finish(null, hdr, buff[@sizeOf(types.Header)..hdr.totalsize]);
 }
 
-pub fn initReader(alloc: Allocator, reader: anytype) !Self {
-    return try init(alloc, reader, reader, error{StreamTooLong}, (struct {
-        fn func(
-            argAlloc: ?Allocator,
-            hdr: types.Header,
-            argReader: @TypeOf(reader),
-        ) (Allocator.Error || @TypeOf(reader).NoEofError || error{StreamTooLong})![]const u8 {
-            return try argReader.readAllAlloc(argAlloc.?, hdr.totalsize - @sizeOf(types.Header));
-        }
-    }).func);
+pub fn initReader(alloc: Allocator, reader: *std.Io.Reader) !Self {
+    const hdr = readHeader(try reader.takeArray(@sizeOf(types.Header)));
+    if (hdr.magic != types.magic) return error.InvalidMagic;
+
+    const buff = try reader.readAlloc(alloc, hdr.totalsize - @sizeOf(types.Header));
+    errdefer alloc.free(buff);
+    return finish(alloc, hdr, buff);
 }
 
-pub fn initFile(alloc: Allocator, file: std.fs.File) !Self {
-    return try init(alloc, file.reader(), file, std.fs.File.ReadError || std.fs.File.MetadataError || error{FileTooBig}, (struct {
-        fn func(
-            argAlloc: ?Allocator,
-            _: types.Header,
-            argFile: std.fs.File,
-        ) (Allocator.Error || std.fs.File.Reader.NoEofError || std.fs.File.ReadError || std.fs.File.MetadataError || error{FileTooBig})![]const u8 {
-            const metadata = try argFile.metadata();
-            return try argFile.readToEndAlloc(argAlloc.?, metadata.size() - @sizeOf(types.Header));
-        }
-    }).func);
+pub fn initFile(alloc: Allocator, io: std.Io, file: std.Io.File) !Self {
+    var buf: [4096]u8 = undefined;
+    var file_reader = file.reader(io, &buf);
+    return initReader(alloc, &file_reader.interface);
 }
 
 pub fn deinit(self: *const Self) void {
@@ -336,4 +311,47 @@ pub fn findLoose(self: *const Self, path: []const []const u8) ![]const u8 {
         }
     }
     return error.NotFound;
+}
+
+pub fn findAs(self: *const Self, comptime T: type, path: []const []const u8) !T {
+    if (T == bool) {
+        _ = self.find(path) catch |err| {
+            if (err == error.NotFound) return false;
+            return err;
+        };
+        return true;
+    }
+
+    return decode(T, try self.find(path));
+}
+
+fn decode(comptime T: type, value: []const u8) error{WrongSize}!T {
+    return switch (@typeInfo(T)) {
+        .int => |info| blk: {
+            if (info.signedness != .unsigned) @compileError("findAs only supports unsigned integers, got " ++ @typeName(T));
+            const len = @divExact(info.bits, 8);
+            if (value.len != len) return error.WrongSize;
+            break :blk std.mem.readInt(T, value[0..len], .big);
+        },
+        .pointer => |info| blk: {
+            if (info.size != .slice or info.child != u8) @compileError("findAs only supports []const u8 slices, got " ++ @typeName(T));
+            const end = std.mem.indexOfScalar(u8, value, 0) orelse value.len;
+            break :blk value[0..end];
+        },
+        else => @compileError("findAs does not support " ++ @typeName(T)),
+    };
+}
+
+test "decode reads an unsigned cell big-endian" {
+    try std.testing.expectEqual(@as(u32, 0x989680), try decode(u32, &.{ 0x00, 0x98, 0x96, 0x80 }));
+    try std.testing.expectEqual(@as(u64, 0x1), try decode(u64, &.{ 0, 0, 0, 0, 0, 0, 0, 1 }));
+}
+
+test "decode rejects a mismatched width" {
+    try std.testing.expectError(error.WrongSize, decode(u32, &.{ 0x00, 0x98 }));
+}
+
+test "decode strips a trailing NUL from a string" {
+    try std.testing.expectEqualStrings("ok", try decode([]const u8, "ok\x00"));
+    try std.testing.expectEqualStrings("nonul", try decode([]const u8, "nonul"));
 }

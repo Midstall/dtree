@@ -1,28 +1,28 @@
 const std = @import("std");
 const dtree = @import("dtree");
 
-const alloc = std.heap.page_allocator;
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const gpa = init.gpa;
 
-pub fn main() !void {
-    var args = try std.process.ArgIterator.initWithAllocator(alloc);
+    var args = try init.minimal.args.iterateAllocator(gpa);
     defer args.deinit();
 
-    _ = args.next();
+    _ = args.skip();
 
-    const path = blk: {
-        const tmp = args.next() orelse return error.MissingArgument;
-        if (std.fs.path.isAbsolute(tmp)) break :blk try alloc.dupe(u8, tmp);
+    const path = args.next() orelse return error.MissingArgument;
 
-        const cwd = try std.process.getCwdAlloc(alloc);
-        defer alloc.free(cwd);
-        break :blk try std.fs.path.join(alloc, &.{ cwd, tmp });
-    };
+    const file = if (std.fs.path.isAbsolute(path))
+        try std.Io.Dir.openFileAbsolute(io, path, .{})
+    else
+        try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
 
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
-
-    const fdt = try dtree.Reader.initFile(alloc, file);
+    const fdt = try dtree.Reader.initFile(gpa, io, file);
     defer fdt.deinit();
 
-    try fdt.writeDts(std.io.getStdOut().writer());
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &stdout_buf);
+    try fdt.writeDts(&stdout.interface);
+    try stdout.interface.flush();
 }
