@@ -1,5 +1,20 @@
 {
   "nodes": {
+    "flakever": {
+      "locked": {
+        "lastModified": 1763450705,
+        "narHash": "sha256-TUSrRfT76OAXty9A4fXlOOfVfJGDglFQs06b8b+f5NY=",
+        "owner": "numinit",
+        "repo": "flakever",
+        "rev": "a69629e4133fbcdf3c7aae477bd6687bb19e0778",
+        "type": "github"
+      },
+      "original": {
+        "owner": "numinit",
+        "repo": "flakever",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1780971357,
@@ -17,6 +32,7 @@
     },
     "root": {
       "inputs": {
+        "flakever": "flakever",
         "nixpkgs": "nixpkgs",
         "treefmt-nix": "treefmt-nix"
       }
