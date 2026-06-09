@@ -1,5 +1,6 @@
 .{
-  .name = "dtree",
-  .version = "0.1.0",
-  .paths = .{"."},
+    .name = .dtree,
+    .version = "0.1.0",
+    .fingerprint = 0x3ceaa750f068abef,
+    .paths = .{"."},
 }

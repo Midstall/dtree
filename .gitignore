@@ -1,3 +1,8 @@
-zig-cache
+.zig-cache
 zig-out
 *.dtb
+!test/*.dtb
+
+.direnv
+result
+result-*
