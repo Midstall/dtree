@@ -129,36 +129,41 @@ pub const NodeIterator = struct {
     }
 
     pub fn next(self: *NodeIterator) !?Node {
-        if (self.depth == self.minDepth and self.pos > self.initPos) return null;
+        while (true) {
+            if (self.depth == self.minDepth and self.pos > self.initPos) return null;
 
-        return switch (try self.token()) {
-            .beginNode => blk: {
-                self.depth += 1;
-                const str = self.string();
-                self.alignTo(u32);
-                break :blk .{ .begin = .{
-                    .name = str,
-                    .depth = self.depth - 1,
-                } };
-            },
-            .endNode => blk: {
-                self.depth -= 1;
-                break :blk .{ .end = .{ .depth = self.depth } };
-            },
-            .prop => blk: {
-                const prop = self.readStruct(types.Prop);
-                const name = self.stringAt(prop.name);
-                const value = self.readBytes(prop.len);
-                self.alignTo(u32);
-                break :blk .{ .prop = .{
-                    .depth = self.depth,
-                    .name = name,
-                    .value = value,
-                } };
-            },
-            .nop => null,
-            .end => error.InvalidToken,
-        };
+            switch (try self.token()) {
+                .beginNode => {
+                    self.depth += 1;
+                    const str = self.string();
+                    self.alignTo(u32);
+                    return .{ .begin = .{
+                        .name = str,
+                        .depth = self.depth - 1,
+                    } };
+                },
+                .endNode => {
+                    self.depth -= 1;
+                    return .{ .end = .{ .depth = self.depth } };
+                },
+                .prop => {
+                    const prop = self.readStruct(types.Prop);
+                    const name = self.stringAt(prop.name);
+                    const value = self.readBytes(prop.len);
+                    self.alignTo(u32);
+                    return .{ .prop = .{
+                        .depth = self.depth,
+                        .name = name,
+                        .value = value,
+                    } };
+                },
+                // A tool that deletes a node or a property in place writes FDT_NOP over
+                // it, so a NOP is a hole and not the end of the data. Step over it and
+                // read the next token. To stop here would hide all that comes after.
+                .nop => {},
+                .end => return error.InvalidToken,
+            }
+        }
     }
 };
 
@@ -248,69 +253,71 @@ pub fn writeDts(self: *const Self, writer: anytype) !void {
     }
 }
 
-pub fn find(self: *const Self, path: []const []const u8) ![]const u8 {
+/// How a node name in the path is compared against a node name in the tree.
+const NameMatch = enum {
+    /// Every name must be equal.
+    exact,
+    /// The name of the node that holds the wanted property is a substring match, so that
+    /// a caller can name `i2c@` and reach `i2c@04000000`. Every other name is equal.
+    loose,
+};
+
+fn nodeNameMatches(
+    name: []const u8,
+    want: []const u8,
+    mode: NameMatch,
+    depth: usize,
+    path_len: usize,
+) bool {
+    if (mode == .loose and depth + 2 == path_len) {
+        return std.mem.containsAtLeast(u8, name, 1, want);
+    }
+    return std.mem.eql(u8, name, want);
+}
+
+/// Walks the tree and returns the value of the property that the path names.
+///
+/// A node counts only when every one of its parents counts. Without that rule a name at
+/// the correct depth in an unrelated subtree answers the query, and the caller gets a
+/// value from the wrong node with no error to show for it.
+fn findPath(self: *const Self, path: []const []const u8, mode: NameMatch) ![]const u8 {
+    if (path.len == 0) return error.NotFound;
+
     var iter = self.nodeIterator();
-    var matchDepth: ?usize = null;
+    // The count of leading path items that the current position matches. It grows only
+    // by one at a time, so it can never skip a level.
+    var matched: usize = 0;
+
     while (try iter.next()) |node| {
-        const depth = node.depth();
-        if (depth >= path.len) continue;
-
-        const name = node.name() orelse continue;
-        const pathItem = path[depth];
-
-        if (!std.mem.eql(u8, name, pathItem)) continue;
-
-        if (node == .begin) {
-            matchDepth = depth;
-        } else if (node == .end) {
-            if (matchDepth) |md| {
-                matchDepth = md - 1;
-            } else matchDepth = null;
-        }
-
-        if ((depth + 1) == path.len and matchDepth != null) {
-            if (matchDepth.? == (depth - 1)) {
-                if (node == .prop) return node.prop.value;
-                return error.UnexpectedBeginOrEnd;
-            }
+        switch (node) {
+            .begin => |b| {
+                if (b.depth != matched or b.depth >= path.len) continue;
+                if (!nodeNameMatches(b.name, path[b.depth], mode, b.depth, path.len)) continue;
+                // The last item of the path names a node and not a property, so there is
+                // no value to give back.
+                if (b.depth + 1 == path.len) return error.UnexpectedBeginOrEnd;
+                matched = b.depth + 1;
+            },
+            .end => |e| {
+                // The node at this depth is closed, so anything it matched stops here.
+                if (matched > e.depth) matched = e.depth;
+            },
+            .prop => |p| {
+                if (p.depth != matched or p.depth + 1 != path.len) continue;
+                if (!std.mem.eql(u8, p.name, path[p.depth])) continue;
+                return p.value;
+            },
         }
     }
     return error.NotFound;
 }
 
+pub fn find(self: *const Self, path: []const []const u8) ![]const u8 {
+    return self.findPath(path, .exact);
+}
+
 pub fn findLoose(self: *const Self, path: []const []const u8) ![]const u8 {
-    var iter = self.nodeIterator();
-    var matchDepth: ?usize = null;
-    while (try iter.next()) |node| {
-        const depth = node.depth();
-        if (depth >= path.len) continue;
-
-        const name = node.name() orelse continue;
-        const pathItem = path[depth];
-
-        const loose = (path.len - 1) == depth + 1;
-        if (loose) {
-            if (!std.mem.containsAtLeast(u8, name, 1, pathItem)) continue;
-        } else {
-            if (!std.mem.eql(u8, name, pathItem)) continue;
-        }
-
-        if (node == .begin) {
-            matchDepth = depth;
-        } else if (node == .end) {
-            if (matchDepth) |md| {
-                matchDepth = md - 1;
-            } else matchDepth = null;
-        }
-
-        if ((depth + 1) == path.len and matchDepth != null) {
-            if (matchDepth.? == (depth - 1)) {
-                if (node == .prop) return node.prop.value;
-                return error.UnexpectedBeginOrEnd;
-            }
-        }
-    }
-    return error.NotFound;
+    return self.findPath(path, .loose);
 }
 
 pub fn findAs(self: *const Self, comptime T: type, path: []const []const u8) !T {
@@ -354,4 +361,249 @@ test "decode rejects a mismatched width" {
 test "decode strips a trailing NUL from a string" {
     try std.testing.expectEqualStrings("ok", try decode([]const u8, "ok\x00"));
     try std.testing.expectEqualStrings("nonul", try decode([]const u8, "nonul"));
+}
+
+/// Builds a small flattened device tree in memory, so that a test can describe an exact
+/// token stream. It fills in only the parts that this reader looks at.
+const TestBlob = struct {
+    gpa: Allocator,
+    structs: std.ArrayList(u8) = .empty,
+    strings: std.ArrayList(u8) = .empty,
+
+    fn deinit(self: *TestBlob) void {
+        self.structs.deinit(self.gpa);
+        self.strings.deinit(self.gpa);
+    }
+
+    fn cell(self: *TestBlob, v: u32) Allocator.Error!void {
+        var b: [4]u8 = undefined;
+        std.mem.writeInt(u32, &b, v, .big);
+        try self.structs.appendSlice(self.gpa, &b);
+    }
+
+    fn padStructs(self: *TestBlob) Allocator.Error!void {
+        while (self.structs.items.len % 4 != 0) try self.structs.append(self.gpa, 0);
+    }
+
+    fn beginNode(self: *TestBlob, node_name: []const u8) Allocator.Error!void {
+        try self.cell(@intFromEnum(types.Token.beginNode));
+        try self.structs.appendSlice(self.gpa, node_name);
+        try self.structs.append(self.gpa, 0);
+        try self.padStructs();
+    }
+
+    fn endNode(self: *TestBlob) Allocator.Error!void {
+        try self.cell(@intFromEnum(types.Token.endNode));
+    }
+
+    fn nop(self: *TestBlob) Allocator.Error!void {
+        try self.cell(@intFromEnum(types.Token.nop));
+    }
+
+    fn prop(self: *TestBlob, prop_name: []const u8, value: []const u8) Allocator.Error!void {
+        const off: u32 = @intCast(self.strings.items.len);
+        try self.strings.appendSlice(self.gpa, prop_name);
+        try self.strings.append(self.gpa, 0);
+
+        try self.cell(@intFromEnum(types.Token.prop));
+        try self.cell(@intCast(value.len));
+        try self.cell(off);
+        try self.structs.appendSlice(self.gpa, value);
+        try self.padStructs();
+    }
+
+    /// Returns the whole blob. The caller frees it.
+    fn finish(self: *TestBlob) Allocator.Error![]u8 {
+        try self.cell(@intFromEnum(types.Token.end));
+
+        const header_size: u32 = @sizeOf(types.Header);
+        // One terminating reserve entry of two zero cells, which every blob carries.
+        const rsvmap_size: u32 = @sizeOf(types.ReserveEntry);
+        const struct_off = header_size + rsvmap_size;
+        const struct_size: u32 = @intCast(self.structs.items.len);
+        const strings_off = struct_off + struct_size;
+        const strings_size: u32 = @intCast(self.strings.items.len);
+
+        var header: types.Header = .{
+            .magic = types.magic,
+            .totalsize = strings_off + strings_size,
+            .off_dt_struct = struct_off,
+            .off_dt_strings = strings_off,
+            .off_mem_rsvmap = header_size,
+            .version = 17,
+            .last_comp_version = 16,
+            .boot_cpuid_phys = 0,
+            .size_dt_strings = strings_size,
+            .size_dt_struct = struct_size,
+        };
+        if (builtin.cpu.arch.endian() != std.builtin.Endian.big) {
+            std.mem.byteSwapAllFields(types.Header, &header);
+        }
+
+        var out: std.ArrayList(u8) = .empty;
+        errdefer out.deinit(self.gpa);
+        try out.appendSlice(self.gpa, std.mem.asBytes(&header));
+        try out.appendNTimes(self.gpa, 0, rsvmap_size);
+        try out.appendSlice(self.gpa, self.structs.items);
+        try out.appendSlice(self.gpa, self.strings.items);
+        return out.toOwnedSlice(self.gpa);
+    }
+};
+
+test "find does not answer from a sibling that shares a name" {
+    const gpa = std.testing.allocator;
+    var b: TestBlob = .{ .gpa = gpa };
+    defer b.deinit();
+
+    // The wanted node comes first and holds nothing. A later sibling with a different
+    // name holds a property of the wanted name. Only ancestry tells the two apart.
+    try b.beginNode("");
+    try b.beginNode("a");
+    try b.endNode();
+    try b.beginNode("b");
+    try b.prop("x", &.{ 0xde, 0xad, 0xbe, 0xef });
+    try b.endNode();
+    try b.endNode();
+
+    const blob = try b.finish();
+    defer gpa.free(blob);
+
+    const reader = try initBuffer(blob);
+    try std.testing.expectError(error.NotFound, reader.find(&.{ "", "a", "x" }));
+}
+
+test "find reads a property out of the named node when a sibling holds the same name" {
+    const gpa = std.testing.allocator;
+    var b: TestBlob = .{ .gpa = gpa };
+    defer b.deinit();
+
+    try b.beginNode("");
+    try b.beginNode("a");
+    try b.prop("x", &.{ 0, 0, 0, 1 });
+    try b.endNode();
+    try b.beginNode("b");
+    try b.prop("x", &.{ 0, 0, 0, 2 });
+    try b.endNode();
+    try b.endNode();
+
+    const blob = try b.finish();
+    defer gpa.free(blob);
+
+    const reader = try initBuffer(blob);
+    try std.testing.expectEqual(@as(u32, 1), try reader.findAs(u32, &.{ "", "a", "x" }));
+    try std.testing.expectEqual(@as(u32, 2), try reader.findAs(u32, &.{ "", "b", "x" }));
+}
+
+test "find does not descend into a node whose parent does not match" {
+    const gpa = std.testing.allocator;
+    var b: TestBlob = .{ .gpa = gpa };
+    defer b.deinit();
+
+    // Both parents hold a child of the same name. Only the chain tells them apart.
+    try b.beginNode("");
+    try b.beginNode("p");
+    try b.beginNode("c");
+    try b.prop("v", &.{ 0, 0, 0, 7 });
+    try b.endNode();
+    try b.endNode();
+    try b.beginNode("q");
+    try b.beginNode("c");
+    try b.prop("v", &.{ 0, 0, 0, 8 });
+    try b.endNode();
+    try b.endNode();
+    try b.endNode();
+
+    const blob = try b.finish();
+    defer gpa.free(blob);
+
+    const reader = try initBuffer(blob);
+    try std.testing.expectEqual(@as(u32, 7), try reader.findAs(u32, &.{ "", "p", "c", "v" }));
+    try std.testing.expectEqual(@as(u32, 8), try reader.findAs(u32, &.{ "", "q", "c", "v" }));
+}
+
+test "findLoose keeps its substring match but still obeys ancestry" {
+    const gpa = std.testing.allocator;
+    var b: TestBlob = .{ .gpa = gpa };
+    defer b.deinit();
+
+    try b.beginNode("");
+    try b.beginNode("soc");
+    try b.beginNode("i2c@04000000");
+    try b.prop("status", "okay\x00");
+    try b.endNode();
+    try b.endNode();
+    try b.beginNode("other");
+    try b.beginNode("i2c@05000000");
+    try b.prop("status", "disabled\x00");
+    try b.endNode();
+    try b.endNode();
+    try b.endNode();
+
+    const blob = try b.finish();
+    defer gpa.free(blob);
+
+    const reader = try initBuffer(blob);
+    try std.testing.expectEqualStrings(
+        "okay",
+        try decode([]const u8, try reader.findLoose(&.{ "", "soc", "i2c@", "status" })),
+    );
+    try std.testing.expectEqualStrings(
+        "disabled",
+        try decode([]const u8, try reader.findLoose(&.{ "", "other", "i2c@", "status" })),
+    );
+}
+
+test "a NOP token does not hide what comes after it" {
+    const gpa = std.testing.allocator;
+    var b: TestBlob = .{ .gpa = gpa };
+    defer b.deinit();
+
+    // A tool that deletes a property in place writes FDT_NOP over it. Everything after
+    // the hole is still real.
+    try b.beginNode("");
+    try b.nop();
+    try b.prop("model", "ok\x00");
+    try b.nop();
+    try b.beginNode("child");
+    try b.nop();
+    try b.prop("v", &.{ 0, 0, 0, 3 });
+    try b.endNode();
+    try b.endNode();
+
+    const blob = try b.finish();
+    defer gpa.free(blob);
+
+    const reader = try initBuffer(blob);
+    try std.testing.expectEqualStrings("ok", try reader.findAs([]const u8, &.{ "", "model" }));
+    try std.testing.expectEqual(@as(u32, 3), try reader.findAs(u32, &.{ "", "child", "v" }));
+}
+
+test "a walk over a tree holding NOP tokens reports every node" {
+    const gpa = std.testing.allocator;
+    var b: TestBlob = .{ .gpa = gpa };
+    defer b.deinit();
+
+    try b.beginNode("");
+    try b.nop();
+    try b.beginNode("one");
+    try b.endNode();
+    try b.nop();
+    try b.beginNode("two");
+    try b.endNode();
+    try b.endNode();
+
+    const blob = try b.finish();
+    defer gpa.free(blob);
+
+    const reader = try initBuffer(blob);
+    var iter = reader.nodeIterator();
+    var names: std.ArrayList([]const u8) = .empty;
+    defer names.deinit(gpa);
+    while (try iter.next()) |node| {
+        if (node == .begin) try names.append(gpa, node.begin.name);
+    }
+    try std.testing.expectEqual(@as(usize, 3), names.items.len);
+    try std.testing.expectEqualStrings("", names.items[0]);
+    try std.testing.expectEqualStrings("one", names.items[1]);
+    try std.testing.expectEqualStrings("two", names.items[2]);
 }
